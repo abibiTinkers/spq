@@ -3,37 +3,32 @@ SPQ - Module 1
 Calibration Feature Extraction Module
 
 Purpose:
-    1. Load a pretrained FP32 MobileNetV2 model.
+    1. Load the FP32 MobileNetV2 trained in Module 0.
     2. Stream a representative calibration subset from Hugging Face.
-    3. Apply model-compatible preprocessing.
+    3. Apply MobileNetV2-compatible preprocessing.
     4. Extract FP32 activation feature maps.
-    5. Cache the activation tensors for subsequent SPQ modules.
+    5. Cache activation tensors for subsequent SPQ modules.
 
 The Hugging Face token is NOT stored in this file.
 """
 
 import torch
 import torch.nn as nn
-
-from torchvision.models import (
-    mobilenet_v2,
-    MobileNet_V2_Weights
-)
+from torchvision.models import mobilenet_v2
 
 
 class CalibrationFeatureExtractor:
     """
     Module 1 of the SPQ pipeline.
 
-    This class:
-        - initializes a pretrained FP32 model
-        - preprocesses streamed images
-        - extracts intermediate FP32 activations
-        - stores them in a calibration cache
+    Loads the disease-trained FP32 MobileNetV2 from Module 0,
+    extracts intermediate FP32 activations, and stores them
+    as a calibration cache.
     """
 
     def __init__(
         self,
+        model_path,
         target_layer_names=None,
         device=None
     ):
@@ -52,32 +47,85 @@ class CalibrationFeatureExtractor:
         print(f"Using device: {self.device}")
 
         # ---------------------------------------------------------
-        # Load pretrained MobileNetV2
+        # Load Module 0 FP32 model
         # ---------------------------------------------------------
 
-        print("Loading pretrained MobileNetV2...")
+        print("Loading Module 0 FP32 MobileNetV2...")
 
-        self.weights = MobileNet_V2_Weights.DEFAULT
-
-        self.model = mobilenet_v2(
-            weights=self.weights
+        checkpoint = torch.load(
+            model_path,
+            map_location="cpu"
         )
 
-        # Important:
-        # Keep the model in FP32.
+        # ---------------------------------------------------------
+        # Obtain state dictionary
+        # ---------------------------------------------------------
+
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            state_dict = checkpoint["model_state_dict"]
+        else:
+            state_dict = checkpoint
+
+        # ---------------------------------------------------------
+        # Detect number of classes from the saved classifier
+        # ---------------------------------------------------------
+
+        classifier_weight = state_dict["classifier.1.weight"]
+
+        num_classes = classifier_weight.shape[0]
+
+        print(f"Detected number of classes: {num_classes}")
+
+        # ---------------------------------------------------------
+        # Create MobileNetV2 architecture
+        # ---------------------------------------------------------
+
+        self.model = mobilenet_v2(weights=None)
+
+        # Replace ImageNet classifier with project classifier
+        self.model.classifier[1] = nn.Linear(
+            self.model.last_channel,
+            num_classes
+        )
+
+        # ---------------------------------------------------------
+        # Load trained Module 0 weights
+        # ---------------------------------------------------------
+
+        self.model.load_state_dict(state_dict)
+
+        # ---------------------------------------------------------
+        # Keep model in FP32
+        # ---------------------------------------------------------
+
         self.model = self.model.float()
-
         self.model.to(self.device)
-
         self.model.eval()
 
-        print("Pretrained FP32 MobileNetV2 loaded successfully.")
+        print(
+            "Module 0 trained FP32 MobileNetV2 "
+            "loaded successfully."
+        )
 
         # ---------------------------------------------------------
         # Model-compatible preprocessing
         # ---------------------------------------------------------
 
-        self.preprocess = self.weights.transforms()
+        self.preprocess = torch.nn.Sequential(
+            nn.Identity()
+        )
+
+        # ImageNet normalization used during Module 0 training
+        from torchvision import transforms
+
+        self.preprocess = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
 
         print("Preprocessing pipeline initialized.")
 
@@ -158,11 +206,6 @@ class CalibrationFeatureExtractor:
 
         def hook(module, inputs, output):
 
-            # Detach from computation graph.
-            #
-            # Move to CPU so that the calibration cache
-            # does not unnecessarily occupy GPU memory.
-
             if isinstance(output, torch.Tensor):
 
                 self.current_activations[layer_name] = (
@@ -188,11 +231,6 @@ class CalibrationFeatureExtractor:
 
     def preprocess_image(self, image):
 
-        """
-        Apply the preprocessing associated with the
-        pretrained MobileNetV2 weights.
-        """
-
         return self.preprocess(image)
 
     # =============================================================
@@ -205,27 +243,6 @@ class CalibrationFeatureExtractor:
         num_samples=1024,
         batch_size=32
     ):
-
-        """
-        Extract FP32 activation feature maps from a streamed
-        calibration subset.
-
-        Parameters
-        ----------
-        dataset_stream:
-            Hugging Face streaming dataset.
-
-        num_samples:
-            Number of calibration images.
-
-        batch_size:
-            Number of images processed at a time.
-
-        Returns
-        -------
-        dict:
-            Dictionary containing FP32 activation tensors.
-        """
 
         print("\n==============================================")
         print("SPQ MODULE 1")
@@ -244,12 +261,7 @@ class CalibrationFeatureExtractor:
             for name in self.target_layer_names
         }
 
-        # ---------------------------------------------------------
-        # Temporary image batch
-        # ---------------------------------------------------------
-
         image_batch = []
-
         samples_processed = 0
 
         # ---------------------------------------------------------
@@ -257,10 +269,6 @@ class CalibrationFeatureExtractor:
         # ---------------------------------------------------------
 
         for sample in dataset_stream:
-
-            # -----------------------------------------------------
-            # Obtain image
-            # -----------------------------------------------------
 
             image = sample.get("image")
 
@@ -273,9 +281,7 @@ class CalibrationFeatureExtractor:
 
             try:
 
-                processed_image = self.preprocess_image(
-                    image
-                )
+                processed_image = self.preprocess_image(image)
 
             except Exception as error:
 
@@ -289,7 +295,7 @@ class CalibrationFeatureExtractor:
             image_batch.append(processed_image)
 
             # -----------------------------------------------------
-            # Stop after requested calibration samples
+            # Process batch
             # -----------------------------------------------------
 
             if (
@@ -298,10 +304,6 @@ class CalibrationFeatureExtractor:
                 samples_processed + len(image_batch)
                 >= num_samples
             ):
-
-                # ---------------------------------------------
-                # Restrict final batch if necessary
-                # ---------------------------------------------
 
                 remaining = (
                     num_samples
@@ -312,18 +314,14 @@ class CalibrationFeatureExtractor:
 
                     image_batch = image_batch[:remaining]
 
-                # ---------------------------------------------
-                # Create batch
-                # ---------------------------------------------
-
                 batch = torch.stack(
                     image_batch,
                     dim=0
                 )
 
-                # ---------------------------------------------
+                # -------------------------------------------------
                 # FP32 inference
-                # ---------------------------------------------
+                # -------------------------------------------------
 
                 batch = batch.to(
                     self.device,
@@ -336,9 +334,9 @@ class CalibrationFeatureExtractor:
 
                     _ = self.model(batch)
 
-                # ---------------------------------------------
+                # -------------------------------------------------
                 # Store FP32 activations
-                # ---------------------------------------------
+                # -------------------------------------------------
 
                 for layer_name in self.target_layer_names:
 
@@ -359,9 +357,9 @@ class CalibrationFeatureExtractor:
                         layer_name
                     ].append(activation)
 
-                # ---------------------------------------------
+                # -------------------------------------------------
                 # Update counter
-                # ---------------------------------------------
+                # -------------------------------------------------
 
                 samples_processed += len(image_batch)
 
@@ -370,10 +368,6 @@ class CalibrationFeatureExtractor:
                     f"{samples_processed}/{num_samples} "
                     f"calibration images"
                 )
-
-                # ---------------------------------------------
-                # Clear batch
-                # ---------------------------------------------
 
                 image_batch = []
 
