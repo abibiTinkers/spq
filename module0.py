@@ -5,10 +5,11 @@ FP32 Baseline Training Module
 Purpose:
     1. Stream the SPQ dataset from Hugging Face.
     2. Automatically detect all class names.
-    3. Create a deterministic 80/20 stratified train/test split.
-    4. Train an FP32 MobileNetV2 disease-classification model.
-    5. Evaluate the untouched test split.
-    6. Return accuracy, precision, recall, F1 and confusion matrix.
+    3. Create a deterministic 80/20 per-class train/test split.
+    4. Handle class imbalance using weighted CrossEntropyLoss.
+    5. Train an FP32 MobileNetV2 disease-classification model.
+    6. Evaluate the untouched test split.
+    7. Return accuracy, precision, recall, F1 and confusion matrix.
 
 Important:
     - No quantization is performed in Module 0.
@@ -25,6 +26,7 @@ from torch.utils.data import DataLoader, IterableDataset
 from torchvision import transforms
 from torchvision.models import mobilenet_v2, MobileNet_V2_Weights
 from datasets import load_dataset
+
 from sklearn.metrics import (
     classification_report,
     confusion_matrix,
@@ -34,15 +36,17 @@ from sklearn.metrics import (
 )
 
 
+# ================================================================
+# Streaming Dataset
+# ================================================================
+
 class SPQStreamingDataset(IterableDataset):
     """
-    Streams images from Hugging Face and applies an automatic
-    deterministic 80/20 per-class split.
+    Streams images from Hugging Face and applies a deterministic
+    80/20 per-class split.
 
     count % 5 == 0 -> test
     otherwise      -> train
-
-    This gives approximately 20% test and 80% train for every class.
     """
 
     def __init__(self, repo_id, split, token, transform):
@@ -52,6 +56,7 @@ class SPQStreamingDataset(IterableDataset):
         self.transform = transform
 
     def __iter__(self):
+
         dataset = load_dataset(
             "imagefolder",
             data_files={
@@ -64,12 +69,17 @@ class SPQStreamingDataset(IterableDataset):
         class_counters = defaultdict(int)
 
         for sample in dataset:
+
             label = int(sample["label"])
 
             count = class_counters[label]
             class_counters[label] += 1
 
-            current_split = "test" if count % 5 == 0 else "train"
+            current_split = (
+                "test"
+                if count % 5 == 0
+                else "train"
+            )
 
             if current_split != self.split:
                 continue
@@ -84,11 +94,11 @@ class SPQStreamingDataset(IterableDataset):
             yield image, label
 
 
+# ================================================================
+# Dataset Information
+# ================================================================
+
 def get_dataset_info(repo_id, token):
-    """
-    Reads dataset metadata through Hugging Face streaming and returns
-    class names and number of classes.
-    """
 
     dataset = load_dataset(
         "imagefolder",
@@ -104,21 +114,97 @@ def get_dataset_info(repo_id, token):
     return class_names, len(class_names)
 
 
-def create_transforms():
+# ================================================================
+# Class Counts
+# ================================================================
+
+def get_class_counts(repo_id, token, num_classes):
+
     """
-    Returns MobileNetV2-compatible training and testing transforms.
+    Counts images belonging to each class.
+
+    This is used only to calculate class weights.
     """
 
+    print()
+    print("Calculating class distribution...")
+
+    dataset = load_dataset(
+        "imagefolder",
+        data_files={
+            "train": f"hf://datasets/{repo_id}/**"
+        },
+        streaming=True,
+        token=token,
+    )["train"]
+
+    counts = [0] * num_classes
+
+    for sample in dataset:
+
+        label = int(sample["label"])
+
+        if 0 <= label < num_classes:
+            counts[label] += 1
+
+    print("Class distribution:")
+
+    for index, count in enumerate(counts):
+        print(f"  Class {index}: {count}")
+
+    return counts
+
+
+# ================================================================
+# Class Weights
+# ================================================================
+
+def calculate_class_weights(class_counts):
+
+    """
+    Calculates inverse-frequency class weights.
+
+    Larger weight is assigned to classes with fewer images.
+    """
+
+    counts = torch.tensor(
+        class_counts,
+        dtype=torch.float32
+    )
+
+    total = counts.sum()
+
+    num_classes = len(class_counts)
+
+    weights = total / (
+        num_classes * counts
+    )
+
+    return weights
+
+
+# ================================================================
+# Transforms
+# ================================================================
+
+def create_transforms():
+
     train_transform = transforms.Compose([
+
         transforms.Resize((224, 224)),
+
         transforms.RandomHorizontalFlip(),
+
         transforms.RandomRotation(10),
+
         transforms.ColorJitter(
             brightness=0.2,
             contrast=0.2,
             saturation=0.2,
         ),
+
         transforms.ToTensor(),
+
         transforms.Normalize(
             mean=[0.485, 0.456, 0.406],
             std=[0.229, 0.224, 0.225],
@@ -126,8 +212,11 @@ def create_transforms():
     ])
 
     test_transform = transforms.Compose([
+
         transforms.Resize((224, 224)),
+
         transforms.ToTensor(),
+
         transforms.Normalize(
             mean=[0.485, 0.456, 0.406],
             std=[0.229, 0.224, 0.225],
@@ -137,13 +226,11 @@ def create_transforms():
     return train_transform, test_transform
 
 
-def create_model(num_classes, device):
-    """
-    Creates an ImageNet-pretrained MobileNetV2 and replaces the
-    classifier for the project's disease classes.
+# ================================================================
+# Model
+# ================================================================
 
-    Precision remains FP32.
-    """
+def create_model(num_classes, device):
 
     model = mobilenet_v2(
         weights=MobileNet_V2_Weights.DEFAULT
@@ -159,51 +246,122 @@ def create_model(num_classes, device):
     return model
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device):
-    """
-    Trains one FP32 epoch over the streaming training set.
-    """
+# ================================================================
+# Train One Epoch
+# ================================================================
+
+def train_one_epoch(
+    model,
+    loader,
+    criterion,
+    optimizer,
+    device,
+    epoch,
+    total_epochs,
+):
 
     model.train()
 
     running_loss = 0.0
+
     correct = 0
     total = 0
     batches = 0
 
+    print()
+    print(
+        f"Epoch {epoch}/{total_epochs}"
+    )
+
+    print("-" * 50)
+
     for images, labels in loader:
-        images = images.to(device, dtype=torch.float32)
+
+        images = images.to(
+            device,
+            dtype=torch.float32
+        )
+
         labels = labels.to(device)
 
         optimizer.zero_grad()
 
         outputs = model(images)
-        loss = criterion(outputs, labels)
+
+        loss = criterion(
+            outputs,
+            labels
+        )
 
         loss.backward()
+
         optimizer.step()
 
         running_loss += loss.item()
 
-        predictions = outputs.argmax(dim=1)
+        predictions = outputs.argmax(
+            dim=1
+        )
 
-        correct += (predictions == labels).sum().item()
+        correct += (
+            predictions == labels
+        ).sum().item()
+
         total += labels.size(0)
+
         batches += 1
 
-    if batches == 0:
-        raise RuntimeError("No training batches were produced.")
+        # --------------------------------------------------------
+        # Progress output
+        # --------------------------------------------------------
 
-    loss_value = running_loss / batches
-    accuracy = (correct / total) * 100.0
+        if batches % 25 == 0:
+
+            current_accuracy = (
+                correct / total
+            ) * 100.0
+
+            print(
+                f"  Batch {batches:4d} | "
+                f"Loss: {loss.item():.4f} | "
+                f"Accuracy: {current_accuracy:.2f}%"
+            )
+
+    if batches == 0:
+        raise RuntimeError(
+            "No training batches were produced."
+        )
+
+    loss_value = (
+        running_loss / batches
+    )
+
+    accuracy = (
+        correct / total
+    ) * 100.0
+
+    print("-" * 50)
+
+    print(
+        f"Epoch {epoch}/{total_epochs} completed | "
+        f"Loss: {loss_value:.4f} | "
+        f"Accuracy: {accuracy:.2f}%"
+    )
 
     return loss_value, accuracy
 
 
-def evaluate(model, loader, criterion, device, class_names):
-    """
-    Evaluates the model on the untouched test split.
-    """
+# ================================================================
+# Evaluation
+# ================================================================
+
+def evaluate(
+    model,
+    loader,
+    criterion,
+    device,
+    class_names
+):
 
     model.eval()
 
@@ -216,16 +374,29 @@ def evaluate(model, loader, criterion, device, class_names):
     all_predictions = []
 
     with torch.no_grad():
+
         for images, labels in loader:
-            images = images.to(device, dtype=torch.float32)
+
+            images = images.to(
+                device,
+                dtype=torch.float32
+            )
+
             labels_device = labels.to(device)
 
             outputs = model(images)
-            loss = criterion(outputs, labels_device)
 
-            predictions = outputs.argmax(dim=1)
+            loss = criterion(
+                outputs,
+                labels_device
+            )
+
+            predictions = outputs.argmax(
+                dim=1
+            )
 
             total_loss += loss.item()
+
             batches += 1
 
             correct += (
@@ -234,15 +405,22 @@ def evaluate(model, loader, criterion, device, class_names):
 
             total += labels.size(0)
 
-            all_labels.extend(labels.numpy())
+            all_labels.extend(
+                labels.numpy()
+            )
+
             all_predictions.extend(
                 predictions.cpu().numpy()
             )
 
     if batches == 0:
-        raise RuntimeError("No test batches were produced.")
+        raise RuntimeError(
+            "No test batches were produced."
+        )
 
-    accuracy = (correct / total) * 100.0
+    accuracy = (
+        correct / total
+    ) * 100.0
 
     precision = precision_score(
         all_labels,
@@ -289,6 +467,10 @@ def evaluate(model, loader, criterion, device, class_names):
     }
 
 
+# ================================================================
+# Main Module 0
+# ================================================================
+
 def run_module0(
     repo_id,
     hf_token,
@@ -299,46 +481,101 @@ def run_module0(
     gamma=0.1,
     device=None,
 ):
-    """
-    Complete Module 0 pipeline.
-
-    Returns:
-        model
-        class_names
-        history
-        results
-    """
 
     if device is None:
+
         device = torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
+            "cuda"
+            if torch.cuda.is_available()
+            else "cpu"
         )
+
     else:
+
         device = torch.device(device)
 
-    print("==============================================")
-    print("SPQ MODULE 0 - FP32 BASELINE TRAINING")
-    print("==============================================")
+    print(
+        "=============================================="
+    )
+
+    print(
+        "SPQ MODULE 0 - FP32 BASELINE TRAINING"
+    )
+
+    print(
+        "=============================================="
+    )
+
     print("Device:", device)
     print("Precision: FP32")
     print("Batch size:", batch_size)
     print("Epochs:", epochs)
     print("Learning rate:", learning_rate)
-    print()
+
+    # ------------------------------------------------------------
+    # Dataset information
+    # ------------------------------------------------------------
 
     class_names, num_classes = get_dataset_info(
         repo_id,
         hf_token,
     )
 
-    print("Detected classes:")
-    for index, name in enumerate(class_names):
-        print(f"  {index}: {name}")
-
-    print("Number of classes:", num_classes)
     print()
+    print("Detected classes:")
 
-    train_transform, test_transform = create_transforms()
+    for index, name in enumerate(class_names):
+
+        print(
+            f"  {index}: {name}"
+        )
+
+    print(
+        "Number of classes:",
+        num_classes
+    )
+
+    # ------------------------------------------------------------
+    # Class distribution
+    # ------------------------------------------------------------
+
+    class_counts = get_class_counts(
+        repo_id,
+        hf_token,
+        num_classes,
+    )
+
+    # ------------------------------------------------------------
+    # Class weights
+    # ------------------------------------------------------------
+
+    class_weights = calculate_class_weights(
+        class_counts
+    )
+
+    print()
+    print("Class weights:")
+
+    for index, weight in enumerate(
+        class_weights
+    ):
+
+        print(
+            f"  {class_names[index]}: "
+            f"{weight.item():.4f}"
+        )
+
+    # ------------------------------------------------------------
+    # Transforms
+    # ------------------------------------------------------------
+
+    train_transform, test_transform = (
+        create_transforms()
+    )
+
+    # ------------------------------------------------------------
+    # Streaming datasets
+    # ------------------------------------------------------------
 
     train_dataset = SPQStreamingDataset(
         repo_id=repo_id,
@@ -354,27 +591,53 @@ def run_module0(
         transform=test_transform,
     )
 
+    # ------------------------------------------------------------
+    # Data loaders
+    # ------------------------------------------------------------
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
+        num_workers=0,
     )
 
     test_loader = DataLoader(
         test_dataset,
         batch_size=batch_size,
+        num_workers=0,
     )
+
+    # ------------------------------------------------------------
+    # Model
+    # ------------------------------------------------------------
 
     model = create_model(
         num_classes,
         device,
     )
 
-    criterion = nn.CrossEntropyLoss()
+    # ------------------------------------------------------------
+    # Weighted loss
+    # ------------------------------------------------------------
+
+    class_weights = class_weights.to(device)
+
+    criterion = nn.CrossEntropyLoss(
+        weight=class_weights
+    )
+
+    # ------------------------------------------------------------
+    # Optimizer
+    # ------------------------------------------------------------
 
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=learning_rate,
     )
+
+    # ------------------------------------------------------------
+    # Learning-rate scheduler
+    # ------------------------------------------------------------
 
     scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer,
@@ -384,26 +647,30 @@ def run_module0(
 
     history = []
 
-    for epoch in range(epochs):
-        train_loss, train_accuracy = train_one_epoch(
-            model,
-            train_loader,
-            criterion,
-            optimizer,
-            device,
+    # ============================================================
+    # Training
+    # ============================================================
+
+    for epoch in range(1, epochs + 1):
+
+        train_loss, train_accuracy = (
+            train_one_epoch(
+                model,
+                train_loader,
+                criterion,
+                optimizer,
+                device,
+                epoch,
+                epochs,
+            )
         )
 
-        current_lr = optimizer.param_groups[0]["lr"]
-
-        print(
-            f"Epoch {epoch + 1}/{epochs} | "
-            f"Loss: {train_loss:.4f} | "
-            f"Accuracy: {train_accuracy:.2f}% | "
-            f"LR: {current_lr:.8f}"
+        current_lr = (
+            optimizer.param_groups[0]["lr"]
         )
 
         history.append({
-            "epoch": epoch + 1,
+            "epoch": epoch,
             "loss": train_loss,
             "accuracy": train_accuracy,
             "learning_rate": current_lr,
@@ -411,10 +678,22 @@ def run_module0(
 
         scheduler.step()
 
+    # ============================================================
+    # Final Test Evaluation
+    # ============================================================
+
     print()
-    print("==============================================")
-    print("MODULE 0 - FINAL FP32 TEST EVALUATION")
-    print("==============================================")
+    print(
+        "=============================================="
+    )
+
+    print(
+        "MODULE 0 - FINAL FP32 TEST EVALUATION"
+    )
+
+    print(
+        "=============================================="
+    )
 
     results = evaluate(
         model,
@@ -424,21 +703,59 @@ def run_module0(
         class_names,
     )
 
-    print(f"Test Loss     : {results['loss']:.4f}")
-    print(f"Test Accuracy : {results['accuracy']:.2f}%")
-    print(f"Precision     : {results['precision']:.4f}")
-    print(f"Recall        : {results['recall']:.4f}")
-    print(f"F1 Score      : {results['f1']:.4f}")
-    print(f"Test Images   : {results['test_images']}")
+    print(
+        f"Test Loss     : {results['loss']:.4f}"
+    )
 
-    print("\nClassification Report:")
-    print(results["classification_report"])
+    print(
+        f"Test Accuracy : {results['accuracy']:.2f}%"
+    )
+
+    print(
+        f"Precision     : {results['precision']:.4f}"
+    )
+
+    print(
+        f"Recall        : {results['recall']:.4f}"
+    )
+
+    print(
+        f"F1 Score      : {results['f1']:.4f}"
+    )
+
+    print(
+        f"Test Images   : {results['test_images']}"
+    )
+
+    print()
+    print("Classification Report:")
+
+    print(
+        results["classification_report"]
+    )
 
     print("Confusion Matrix:")
-    print(results["confusion_matrix"])
 
-    print("\n==============================================")
-    print("MODULE 0 COMPLETED")
-    print("==============================================")
+    print(
+        results["confusion_matrix"]
+    )
 
-    return model, class_names, history, results
+    print()
+    print(
+        "=============================================="
+    )
+
+    print(
+        "MODULE 0 COMPLETED"
+    )
+
+    print(
+        "=============================================="
+    )
+
+    return (
+        model,
+        class_names,
+        history,
+        results,
+    )
