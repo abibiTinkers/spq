@@ -2,28 +2,23 @@
 SPQ - Module 1
 Calibration Feature Extraction Module
 
-Pipeline:
-    Hugging Face dataset
-        ↓
-    Image preprocessing
-        ↓
-    ImageNet-pretrained MobileNetV2
-        ↓
-    FP32 feature-map extraction
-        ↓
-    Calibration activation cache
-
 Purpose:
-    Extract FP32 intermediate feature maps from a
-    representative calibration subset of 1024 images.
+    1. Load ImageNet-pretrained MobileNetV2.
+    2. Accept a representative calibration set.
+    3. Generate FP32 intermediate activation feature maps.
+    4. Cache the feature maps for Modules 2, 3 and 4.
 
-No training is performed in this module.
-No Hugging Face token is stored in this file.
+No model training is performed.
+No dataset downloading or dataset splitting is performed.
+No Hugging Face token is stored here.
 """
 
 import torch
 from torchvision import transforms
-from torchvision.models import mobilenet_v2, MobileNet_V2_Weights
+from torchvision.models import (
+    mobilenet_v2,
+    MobileNet_V2_Weights
+)
 
 
 class CalibrationFeatureExtractor:
@@ -48,10 +43,10 @@ class CalibrationFeatureExtractor:
         print("Using device:", self.device)
 
         # ---------------------------------------------------------
-        # Load ImageNet-pretrained MobileNetV2
+        # MobileNetV2
         # ---------------------------------------------------------
 
-        print("Loading MobileNetV2...")
+        print("Loading ImageNet-pretrained MobileNetV2...")
 
         self.weights = MobileNet_V2_Weights.DEFAULT
 
@@ -59,16 +54,15 @@ class CalibrationFeatureExtractor:
             weights=self.weights
         )
 
-        # Keep model in FP32
         self.model = self.model.float()
         self.model = self.model.to(self.device)
         self.model.eval()
 
         print("MobileNetV2 loaded successfully.")
-        print("Model precision: FP32")
+        print("Precision: FP32")
 
         # ---------------------------------------------------------
-        # Image preprocessing
+        # Standard MobileNetV2 preprocessing
         # ---------------------------------------------------------
 
         self.preprocess = transforms.Compose([
@@ -80,14 +74,11 @@ class CalibrationFeatureExtractor:
             )
         ])
 
-        print("Preprocessing initialized.")
-
         # ---------------------------------------------------------
-        # Feature-map layers
+        # Target layers
         # ---------------------------------------------------------
 
         if target_layer_names is None:
-
             target_layer_names = [
                 "features.6",
                 "features.13",
@@ -103,21 +94,16 @@ class CalibrationFeatureExtractor:
             if name in self.target_layer_names:
                 self.target_layers[name] = layer
 
-        missing_layers = [
-            name
-            for name in self.target_layer_names
-            if name not in self.target_layers
-        ]
-
-        if missing_layers:
+        if len(self.target_layers) != len(
+            self.target_layer_names
+        ):
             raise ValueError(
-                "Target layers not found: "
-                + str(missing_layers)
+                "One or more target layers were not found."
             )
 
-        print("Target feature-map layers:")
+        print("Target layers:")
 
-        for name in self.target_layers:
+        for name in self.target_layer_names:
             print("  -", name)
 
         # ---------------------------------------------------------
@@ -145,7 +131,7 @@ class CalibrationFeatureExtractor:
 
             self.hooks.append(hook)
 
-        print("Forward hooks registered.")
+        print("Forward hooks registered successfully.")
 
     # =============================================================
     # Forward hook
@@ -157,7 +143,9 @@ class CalibrationFeatureExtractor:
 
             if isinstance(output, torch.Tensor):
 
-                self.current_activations[layer_name] = (
+                self.current_activations[
+                    layer_name
+                ] = (
                     output.detach()
                     .float()
                     .cpu()
@@ -166,7 +154,7 @@ class CalibrationFeatureExtractor:
         return hook
 
     # =============================================================
-    # Image preprocessing
+    # Preprocess one image
     # =============================================================
 
     def preprocess_image(self, image):
@@ -177,13 +165,12 @@ class CalibrationFeatureExtractor:
         return self.preprocess(image)
 
     # =============================================================
-    # Extract calibration feature maps
+    # Extract feature maps
     # =============================================================
 
-    def extract_from_stream(
+    def extract_features(
         self,
-        dataset_stream,
-        num_samples=1024,
+        calibration_images,
         batch_size=32
     ):
 
@@ -192,134 +179,104 @@ class CalibrationFeatureExtractor:
         print("CALIBRATION FEATURE EXTRACTION")
         print("==============================================")
 
-        print("Calibration images:", num_samples)
-        print("Batch size:", batch_size)
+        print(
+            "Calibration samples:",
+            len(calibration_images)
+        )
+
+        print(
+            "Batch size:",
+            batch_size
+        )
+
+        # ---------------------------------------------------------
+        # Reset cache
+        # ---------------------------------------------------------
 
         self.activation_cache = {
             name: []
             for name in self.target_layer_names
         }
 
-        image_batch = []
-        samples_processed = 0
-
         # ---------------------------------------------------------
-        # Stream dataset
+        # Process images in batches
         # ---------------------------------------------------------
 
-        for sample in dataset_stream:
+        total = len(calibration_images)
 
-            image = sample.get("image")
+        for start in range(
+            0,
+            total,
+            batch_size
+        ):
 
-            if image is None:
-                continue
+            end = min(
+                start + batch_size,
+                total
+            )
 
-            try:
+            images = calibration_images[
+                start:end
+            ]
 
-                processed_image = self.preprocess_image(
-                    image
+            processed_images = []
+
+            for image in images:
+
+                processed_images.append(
+                    self.preprocess_image(image)
                 )
 
-            except Exception as error:
+            batch = torch.stack(
+                processed_images
+            )
 
-                print(
-                    "Skipping image:",
-                    error
-                )
+            batch = batch.to(
+                self.device,
+                dtype=torch.float32
+            )
 
-                continue
-
-            image_batch.append(processed_image)
+            self.current_activations = {}
 
             # -----------------------------------------------------
-            # Process batch
+            # FP32 forward pass
             # -----------------------------------------------------
 
-            if (
-                len(image_batch) == batch_size
-                or
-                samples_processed + len(image_batch)
-                >= num_samples
-            ):
+            with torch.no_grad():
 
-                remaining = (
-                    num_samples
-                    - samples_processed
-                )
+                self.model(batch)
 
-                if len(image_batch) > remaining:
-                    image_batch = image_batch[:remaining]
+            # -----------------------------------------------------
+            # Store feature maps
+            # -----------------------------------------------------
 
-                batch = torch.stack(
-                    image_batch,
-                    dim=0
-                )
+            for layer_name in self.target_layer_names:
 
-                batch = batch.to(
-                    self.device,
-                    dtype=torch.float32
-                )
-
-                self.current_activations = {}
-
-                # -------------------------------------------------
-                # FP32 forward pass
-                # -------------------------------------------------
-
-                with torch.no_grad():
-                    self.model(batch)
-
-                # -------------------------------------------------
-                # Cache feature maps
-                # -------------------------------------------------
-
-                for layer_name in self.target_layer_names:
-
-                    if layer_name not in self.current_activations:
-
-                        raise RuntimeError(
-                            "No activation captured for "
-                            + layer_name
-                        )
-
-                    activation = (
-                        self.current_activations[
-                            layer_name
-                        ]
-                    )
-
-                    self.activation_cache[
+                activation = (
+                    self.current_activations[
                         layer_name
-                    ].append(activation)
-
-                samples_processed += len(image_batch)
-
-                print(
-                    f"Processed "
-                    f"{samples_processed}/{num_samples}"
+                    ]
                 )
 
-                image_batch = []
+                self.activation_cache[
+                    layer_name
+                ].append(activation)
 
-            if samples_processed >= num_samples:
-                break
+            print(
+                f"Processed {end}/{total}"
+            )
 
         # ---------------------------------------------------------
         # Verification
         # ---------------------------------------------------------
 
         print("\n==============================================")
-        print("CALIBRATION EXTRACTION COMPLETED")
+        print("FEATURE EXTRACTION COMPLETED")
         print("==============================================")
 
-        print(
-            "Total images:",
-            samples_processed
-        )
-
-        for layer_name in self.activation_cache:
-
-            batches = self.activation_cache[layer_name]
+        for layer_name, batches in (
+            self.activation_cache.items()
+        ):
 
             print(
                 f"\nLayer: {layer_name}"
@@ -338,7 +295,7 @@ class CalibrationFeatureExtractor:
                 )
 
                 print(
-                    "Feature-map dtype:",
+                    "Dtype:",
                     batches[0].dtype
                 )
 
